@@ -1,11 +1,15 @@
-import express from 'express';
-import { getOrders, createOrder, updateOrder } from '../controllers/orderController.js';
-import { verifyToken } from '../middleware/authMiddleware.js';
+// /api/orders/*
+import { Router } from 'express';
+import { orderController } from '../controllers/orderController.js';
+import { requireAuth } from '../middleware/auth.js';
 
-const router = express.Router();
+export default function orderRoutes(db) {
+  const router = Router();
+  const c = orderController(db);
 
-router.get('/', verifyToken, getOrders);
-router.post('/', verifyToken, createOrder);
-router.put('/:id', verifyToken, updateOrder);
-
-export default router;
+  router.post('/orders', requireAuth(), c.create);              // owner or staff can take an order
+  router.get('/orders', requireAuth('owner'), c.list);          // owner only: view a day's orders
+  router.patch('/orders/:id', requireAuth('owner'), c.correct); // owner only: correct a total
+  router.put('/orders/:id', requireAuth('owner'), c.correct);   // same handler, for clients that use PUT
+  return router;
+}

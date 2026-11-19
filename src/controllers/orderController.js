@@ -1,154 +1,105 @@
-import pool from '../config/db.js';
+// Orders: take an order, list a day's orders, correct a total.
+import { FLAVOURS, ORDER_TYPES, PAYMENTS } from '../config/constants.js';
+import { dateFromQuery, httpError, isBuldak, isInt, isText, parseId } from '../utils/helpers.js';
 
-export async function getOrders(req, res) {
-  const { date } = req.query; // Optional filter: ?date=YYYY-MM-DD
-  try {
-    const query = date
-      ? `SELECT o.*, COALESCE(json_agg(oi.*) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items
-         FROM orders o
-         LEFT JOIN order_items oi ON o.id = oi.order_id
-         WHERE o.order_date = $1
-         GROUP BY o.id
-         ORDER BY o.created_at DESC`
-      : `SELECT o.*, COALESCE(json_agg(oi.*) FILTER (WHERE oi.id IS NOT NULL), '[]') AS items
-         FROM orders o
-         LEFT JOIN order_items oi ON o.id = oi.order_id
-         GROUP BY o.id
-         ORDER BY o.created_at DESC`;
+export const orderController = (db) => ({
+  /**
+   * POST /api/orders
+   * { items: [{ id, qty, flavour? }], order_type, boxes?, plastics?, payment }
+   * Validates everything, prices the order from the MENU (never from the client), then saves
+   * the order and its lines together in one transaction.
+   */
+  async create(req, res) {
+    const { items, order_type, boxes = 0, plastics = 0, payment } = req.body ?? {};
 
-    const result = await pool.query(query, date ? [date] : []);
-    res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error fetching orders' });
-  }
-}
-
-export async function createOrder(req, res) {
-  const {
-    order_type = 'dine_in',
-    boxes = 0,
-    plastics = 0,
-    payment = 'Cash',
-    items = []
-  } = req.body;
-
-  if (!Array.isArray(items) || items.length === 0) {
-    return res.status(400).json({ error: 'Order must include at least one item' });
-  }
-
-  const total = items.reduce((sum, item) => sum + (item.unit_price * item.qty), 0);
-  const created_by = req.user?.username || 'system';
-  const order_date = new Date().toISOString().split('T')[0];
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const orderResult = await client.query(
-      `INSERT INTO orders (order_date, order_type, boxes, plastics, payment, total, created_by, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       RETURNING *`,
-      [order_date, order_type, boxes, plastics, payment, total, created_by]
-    );
-    const order = orderResult.rows[0];
-
-    const insertedItems = [];
-    for (const item of items) {
-      const itemRes = await client.query(
-        `INSERT INTO order_items (order_id, menu_item_id, name, category, flavour, qty, unit_price)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING *`,
-        [
-          order.id,
-          item.menu_item_id || null,
-          item.name,
-          item.category || null,
-          item.flavour || null,
-          item.qty,
-          item.unit_price
-        ]
-      );
-      insertedItems.push(itemRes.rows[0]);
+    // 1) Shape checks (no database needed)
+    if (!Array.isArray(items) || items.length === 0) throw httpError(400, 'Add at least one item');
+    if (items.some((i) => !isInt(i?.id) || !isInt(i?.qty) || i.qty < 1 || i.qty > 99)) throw httpError(400, 'Invalid item or quantity');
+    if (!ORDER_TYPES.includes(order_type)) throw httpError(400, 'Choose Dine-in or Take-out');
+    if (!PAYMENTS.includes(payment)) throw httpError(400, 'Choose Cash or InstaPay');
+    const takeOut = order_type === 'take_out';
+    if (takeOut && ![boxes, plastics].every((n) => isInt(n) && n >= 0 && n <= 20)) {
+      throw httpError(400, 'Boxes and plastics must be whole numbers from 0 to 20');
     }
 
-    await client.query('COMMIT');
-    res.status(201).json({ ...order, items: insertedItems });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('Detailed order creation error:', err);
-    res.status(500).json({ error: 'Server error creating order', details: err.message });
-  } finally {
-    client.release();
-  }
-}
-
-export async function updateOrder(req, res) {
-  const { id } = req.params;
-  const { order_type, boxes, plastics, payment, items, reason = 'Order updated' } = req.body;
-  const changed_by = req.user?.username || 'system';
-
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    const existingRes = await client.query('SELECT * FROM orders WHERE id = $1', [id]);
-    if (existingRes.rows.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    const existingOrder = existingRes.rows[0];
-
-    const newTotal = Array.isArray(items)
-      ? items.reduce((sum, item) => sum + (item.unit_price * item.qty), 0)
-      : existingOrder.total;
-
-    const updatedRes = await client.query(
-      `UPDATE orders
-       SET order_type = COALESCE($1, order_type),
-           boxes = COALESCE($2, boxes),
-           plastics = COALESCE($3, plastics),
-           payment = COALESCE($4, payment),
-           total = $5
-       WHERE id = $6
-       RETURNING *`,
-      [order_type, boxes, plastics, payment, newTotal, id]
-    );
-
-    if (Array.isArray(items)) {
-      await client.query('DELETE FROM order_items WHERE order_id = $1', [id]);
-      for (const item of items) {
-        await client.query(
-          `INSERT INTO order_items (order_id, menu_item_id, name, category, flavour, qty, unit_price)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            id,
-            item.menu_item_id || null,
-            item.name,
-            item.category || null,
-            item.flavour || null,
-            item.qty,
-            item.unit_price
-          ]
-        );
-      }
+    // 2) Menu checks: item exists, is available, Buldak has a flavour
+    const wanted = [...new Set(items.map((i) => i.id))];
+    const { rows: menu } = await db.query(
+      'SELECT id, name, category, price, available FROM menu_items WHERE id = ANY($1::int[])', [wanted]);
+    const byId = new Map(menu.map((m) => [m.id, m]));
+    for (const i of items) {
+      const m = byId.get(i.id);
+      if (!m) throw httpError(400, 'Unknown menu item');
+      if (!m.available) throw httpError(400, `${m.name} is unavailable`);
+      if (isBuldak(m) && !FLAVOURS.includes(i.flavour)) throw httpError(400, `Choose a flavour for ${m.name}`);
     }
 
-    if (newTotal !== existingOrder.total) {
+    // 3) Price it from the menu: the server is the source of truth
+    const total = items.reduce((sum, i) => sum + byId.get(i.id).price * i.qty, 0);
+
+    // 4) Save order + lines atomically: either both are saved or neither is
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        'INSERT INTO orders (order_type, boxes, plastics, payment, total, created_by) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+        [order_type, takeOut ? boxes : 0, takeOut ? plastics : 0, payment, total, req.user.username]);
+      const order = rows[0];
       await client.query(
-        `INSERT INTO order_changes (order_id, old_total, new_total, reason, changed_by)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [id, existingOrder.total, newTotal, reason, changed_by]
-      );
+        `INSERT INTO order_items (order_id, menu_item_id, name, category, flavour, qty, unit_price)
+         SELECT $1, x.id, x.name, x.category, x.flavour, x.qty, x.price
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::text[], $6::int[], $7::int[]) AS x(id, name, category, flavour, qty, price)`,
+        [order.id,
+          items.map((i) => i.id),
+          items.map((i) => byId.get(i.id).name),
+          items.map((i) => byId.get(i.id).category),
+          items.map((i) => (isBuldak(byId.get(i.id)) ? i.flavour : null)), // flavour only kept for Buldak
+          items.map((i) => i.qty),
+          items.map((i) => byId.get(i.id).price)]); // price snapshot (AC-15)
+      await client.query('COMMIT');
+      res.status(201).json(order);
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
+  },
 
-    await client.query('COMMIT');
-    res.json(updatedRes.rows[0]);
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ error: 'Server error updating order' });
-  } finally {
-    client.release();
-  }
-}
+  /** GET /api/orders?date=YYYY-MM-DD  (owner) -> that day's orders, each with its change log. */
+  async list(req, res) {
+    const date = dateFromQuery(req);
+    const { rows } = await db.query(
+      `SELECT o.id, to_char(o.order_date, 'YYYY-MM-DD') AS order_date, o.order_type, o.boxes, o.plastics,
+              o.payment, o.total, o.created_by, o.created_at,
+              COALESCE((SELECT json_agg(c ORDER BY c.at) FROM order_changes c WHERE c.order_id = o.id), '[]') AS changes
+       FROM orders o WHERE o.order_date = $1 ORDER BY o.id`, [date]);
+    res.json(rows);
+  },
+
+  /** PATCH /api/orders/:id  { total, reason } (owner) -> corrects the total and logs old value, user, reason. */
+  async correct(req, res) {
+    const id = parseId(req);
+    const { total, reason } = req.body ?? {};
+    if (!isInt(total) || total < 0) throw httpError(400, 'Total must be a whole number, 0 or more');
+    if (!isText(reason)) throw httpError(400, 'A reason is required');
+
+    const client = await db.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows: found } = await client.query('SELECT total FROM orders WHERE id = $1 FOR UPDATE', [id]); // lock the row
+      if (!found.length) throw httpError(404, 'Order not found');
+      await client.query(
+        'INSERT INTO order_changes (order_id, old_total, new_total, reason, changed_by) VALUES ($1, $2, $3, $4, $5)',
+        [id, found[0].total, total, reason.trim(), req.user.username]);
+      const { rows } = await client.query('UPDATE orders SET total = $1 WHERE id = $2 RETURNING *', [total, id]);
+      await client.query('COMMIT');
+      res.json(rows[0]);
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  },
+});
